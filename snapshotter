@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+#
+# snapshotter
+#
+# Requires Python 3.7+ as we depend on dictionaries retaining order.
+#
+#
+# Summary:
+# snapshotter executes rsnapshot using the required retain-levels as needed
+# making it possible to create a new snapshot at will, without any concern to
+# which retain-levels must be used.
+#
+#
+# Implementation:
+# snapshotter reads the retain parameters from an rsnapshot configuration file
+# and stores the product of these as the cycle_total. For example:
+#   retain  alpha   7
+#   retain  beta    8
+#   retain  gamma   4
+# would give a cycle_total of 224.
+#
+# snapshotter uses cycle_index to track the current position within the
+# entire rsnapshot retain cycle. This is persisted in a local file.
+#
+# Finally, snapshotter determines which rsnapshot levels to execute by testing
+# the current cycle_index against a moduli dictionary for each retain level.
+
+
+import argparse
+import hashlib
+import logging
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from functools import reduce
+from pathlib import Path
+
+
+__version__ = "0.13.5"
+
+class RsnapshotConfig:
+    """Reads retain-levels from rsnapshot configuration file."""
+
+    RSNAPSHOT_CONF_FILE = '/etc/rsnapshot.conf'
+
+    def __init__(self, rsnapshot_conf=None):
+        self._is_default_conf = rsnapshot_conf is None
+        if self._is_default_conf:
+            rsnapshot_conf = Path(self.RSNAPSHOT_CONF_FILE)
+        self._conf_file = str(Path(rsnapshot_conf).expanduser())
+        self._levels = None
+        self._moduli = None
+        self._cycle_total = None
+        self._conf = {}
+        self.parse()
+
+    def __str__(self):
+        return self._conf_file
+
+    @property
+    def is_default_conf(self):
+        """Return boolean indicating if rsnapshot config file is default"""
+        return self._is_default_conf
+
+    @property
+    def cycle_total(self):
+        """Return the total number of cycles for all retain levels"""
+        if self._cycle_total is None:
+            self._cycle_total = reduce(lambda a, b: a * b, self.levels.values())
+        return self._cycle_total
+
+    @property
+    def levels(self):
+        """Return dictionary of retain-level names to retention integer"""
+        return self._conf['retain']
+
+    @property
+    def moduli(self):
+        """Sets self.moduli{} dictionary"""
+        if self._moduli is None:
+            self._moduli = {}
+            total = 1
+            for name in self.levels:
+                count = self.levels[name]
+                self._moduli[name] = total
+                total *= count
+        return self._moduli
+
+    @property
+    def snapshot_root(self):
+        """Return rsnapshot 'snapshot_root' path string"""
+        return self._conf['snapshot_root']
+
+    def _parse_snapshot_root(self, value):
+        self._conf['snapshot_root'] = value
+
+    def _parse_retain(self, value):
+        if 'retain' not in self._conf:
+            self._conf['retain'] = {}
+        name, count = re.split('\t+', value, 2)
+        self._conf['retain'][name] = int(count)
+
+    def parse(self):
+        """Parse rsnapshot config and store info we're interested in"""
+        parse_params = ['snapshot_root', 'retain']
+        # rsnapshot config; uses tabs between elements and uses # for comment lines
+        with open(self._conf_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                key, value = re.split('\t+', line, 1)
+                if key in parse_params:
+                    parse_method = getattr(self, '_parse_' + key)
+                    parse_method(value)
+
+
+class Snapshotter:
+    """Execute appropriate rsnapshot commands based on configuration"""
+
+    CYCLE_FILE_BASE = 'cycle-index'
+    CYCLE_FILE_DIR = '~/.config/snapshotter'
+
+    def __init__(self, args, loglevel=logging.WARNING):
+        """Initialize attributes including RsnapshotConf instance"""
+        self.loglevel = loglevel
+        if loglevel == logging.DEBUG:
+            logging.basicConfig(level=loglevel,
+                                format='%(levelname)s: %(module)s:%(lineno)d %(message)s')
+        else:
+            logging.basicConfig(level=loglevel,
+                                format='%(message)s')
+
+        self._rsnapshot_conf = RsnapshotConfig(args.rsnapshot_conf)
+
+        if args.cycle_file is None:
+            conf_hash = hashlib.md5(str(self._rsnapshot_conf).encode('utf-8')).hexdigest()
+            self._cycle_file = Path(self.CYCLE_FILE_DIR,
+                                self.CYCLE_FILE_BASE + '-' + conf_hash).expanduser()
+        else:
+            self._cycle_file = Path(args.cycle_file).expanduser()
+
+        self._cycle_index = None
+        self._dryrun = args.dryrun
+        self._inhibit_hours = args.inhibit
+        self._symlink_dir = args.symlink_dir
+        self._symlink_suffix = args.symlink_suffix
+        logging.debug('Log level: %s (%s)', self.loglevel, logging.getLevelName(self.loglevel))
+        if self._dryrun:
+            logging.info('**Dry-run**')
+        logging.info('rsnapshot config: %s', self._rsnapshot_conf)
+        logging.info('Cycle index file: %s', self._cycle_file)
+        logging.debug('Retain levels: %s', self._rsnapshot_conf.levels)
+        logging.debug('Level moduli: %s', self._rsnapshot_conf.moduli)
+        logging.debug('Cycle total: %s', self._rsnapshot_conf.cycle_total)
+
+    @property
+    def cycle_index(self):
+        """Return the current cycle index"""
+        if self._cycle_index is None:
+            if not Path(self._cycle_file).is_file():
+                self._cycle_index = 0
+            else:
+                try:
+                    with open(self._cycle_file) as f:
+                        self._cycle_index = int(f.read())
+                except ValueError:
+                    raise ValueError(f'Cycle-index file {self._cycle_file} is'
+                                     ' corrupt.  Deleting it would "fix" the'
+                                     ' problem, but reset the cycle.')
+            logging.debug('Cycle index: %s', self._cycle_index)
+        return self._cycle_index
+
+    @cycle_index.setter
+    def cycle_index(self, value):
+        """Set cycle_index property and write to file"""
+        if value != self._cycle_index:
+            self._cycle_index = value
+            if not self._dryrun:
+                logging.debug('Set cycle index to: %s', self._cycle_index)
+                dirname = Path(self._cycle_file).parent
+                Path(dirname).mkdir(parents=True, exist_ok=True)
+                with open(self._cycle_file, 'w') as f:
+                    f.write(str(self._cycle_index))
+
+    @property
+    def is_inhibited(self):
+        """Return boolean True if execution is currently inhibited"""
+        snapshot_first = list(self._rsnapshot_conf.levels.keys())[0] + '.0'
+        snapshot_path = Path(self._rsnapshot_conf.snapshot_root, snapshot_first)
+        snapshot_mtime_stat = os.stat(snapshot_path).st_mtime
+        snapshot_mtime = datetime.fromtimestamp(snapshot_mtime_stat, tz=timezone.utc)
+        snapshot_delta = datetime.now(tz=timezone.utc) - snapshot_mtime
+        return snapshot_delta < timedelta(hours=self._inhibit_hours)
+
+    def create_symlinks(self):
+        """Remove old snapshot symlinks and create new ones"""
+        if not self._symlink_dir:
+            return
+        if not os.path.isdir(self._symlink_dir):
+            logging.critical('symlink-dir (%s) is not found or not a directory.'
+                             ' Cannot create symlinks', self._symlink_dir)
+            return
+
+        snapshot_root = self._rsnapshot_conf.snapshot_root
+
+        # Iterate _symlink_dir, find existing symlinks and delete them
+        logging.info('Removing old snapshot symlinks')
+        for f in os.listdir(self._symlink_dir):
+            file = os.path.join(self._symlink_dir, f)
+            if os.path.islink(file):
+                link_target = Path(file).resolve()
+                common_prefix = os.path.commonprefix([snapshot_root, link_target])
+                if common_prefix == snapshot_root:
+                    logging.debug('Removing symlink %s', file)
+                    Path.unlink(Path(file))
+
+        # Iterate snapshot_root dir and create symlinks too these dirs from symlink_dir
+        logging.info('Creating new snapshot symlinks')
+        for f in os.listdir(snapshot_root):
+            file = os.path.join(snapshot_root, f)
+            snapshot_mtime_stat = os.stat(file).st_mtime
+            snapshot_mtime = datetime.fromtimestamp(snapshot_mtime_stat)
+            symlink_name = snapshot_mtime.strftime('%Y%m%d-%H%M')
+            symlink_path = Path(self._symlink_dir, symlink_name)
+            if self._symlink_suffix:
+                symlink_target = Path(file, self._symlink_suffix)
+            else:
+                symlink_target = file
+            logging.debug('Creating symlink %s', symlink_path)
+            os.symlink(symlink_target, symlink_path)
+
+    def exec_rsnapshot(self, rsnapshot_args):
+        """Increment cycle_index and execute appropriate rsnapshot commands"""
+        if self.is_inhibited:
+            print('Execution prevented as last rsnapshot too recent')
+            return
+        self.cycle_index = (self.cycle_index + 1) % self._rsnapshot_conf.cycle_total
+        for name in sorted(self._rsnapshot_conf.moduli.keys(), reverse=True):
+            if self.cycle_index % self._rsnapshot_conf.moduli[name] == 0:
+                command = ['rsnapshot']
+                if self._dryrun:
+                    command.append('-t')
+                command.extend(rsnapshot_args)
+                if not self._rsnapshot_conf.is_default_conf:
+                    command.extend(['-c', str(self._rsnapshot_conf)])
+                command.append(name)
+                cmd_str = " ".join(f'"{a}"' if " " in a else a for a in command)
+                logging.info('Exec command: %s', cmd_str)
+                p = subprocess.run(command, check=False)
+                if p.returncode != 0:
+                    raise ChildProcessError(f'The command "{" ".join(command)}"'
+                                        f' returned non-zero status {p.returncode}')
+        self.create_symlinks()
+
+
+def non_negative_int(value):
+    """Return value if non-negative integer or raise exception"""
+    if int(value) < 0:
+        raise ValueError('value must be an integer equal to or greater than zero')
+    return int(value)
+
+
+def main():
+    """Deal with command line arg parsing and Snapshotter instantiation"""
+    parser = argparse.ArgumentParser(
+        prog='snapshotter',
+        description='Execute appropriate rsnapshot command(s) based on'
+                    ' current point in retain cycle')
+    parser.add_argument('-c', '--config',
+                        dest='rsnapshot_conf',
+                        metavar='rsnapshot_config_file',
+                        default=None)
+    parser.add_argument('--cycle-file',
+                        metavar='path',
+                        help='file used to retain current cycle count',
+                        default=None)
+    parser.add_argument('--inhibit',
+                        metavar='hours',
+                        type=non_negative_int,
+                        default=1,
+                        help='number of hours to prevent another snapshot being run')
+    parser.add_argument('--symlink-dir',
+                        metavar='path',
+                        help='directory into which symlinks to each snapshot will be created')
+    parser.add_argument('--symlink-suffix',
+                        metavar='relative-path',
+                        help='relative path from rsnapshot-root to target directory')
+    parser.add_argument('-n', '--dryrun',
+                        action='store_true',
+                        default=False,
+                        help='dryrun, show shell commands that would be executed')
+    parser.add_argument('-t',
+                        dest='dryrun',
+                        action='store_true',
+                        default=False,
+                        help='alias for --dryrun')
+    parser.add_argument('-v', '--verbose',
+                        action='count',
+                        default=0,
+                        help='verbose, increase verbosity')
+    parser.add_argument('-D',
+                        dest='diagnostic',
+                        action='store_true',
+                        default=False,
+                        help='debug, outputs debugging/diagnostic info')
+    parser.add_argument('-q',
+                        dest='quiet',
+                        action='store_true',
+                        default=False,
+                        help='quiet, surpress non-fatal warnings')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    args = parser.parse_args()
+
+    if (args.symlink_dir is None and args.symlink_suffix):
+        parser.error('--symlink-dir required when --symlink-suffix is supplied')
+
+    rsnapshot_args = set()
+    loglevel = None
+    if args.quiet:
+        rsnapshot_args.add('-q')
+        loglevel = logging.CRITICAL
+    if args.verbose > 0:
+        loglevel = logging.INFO
+    if args.verbose == 2:
+        rsnapshot_args.add('-v')
+    elif args.verbose == 3:
+        rsnapshot_args.add('-V')
+    if args.diagnostic:
+        rsnapshot_args.add('-D')
+        loglevel = logging.DEBUG
+
+    try:
+        snapshotter = Snapshotter(args=args, loglevel=loglevel)
+        snapshotter.exec_rsnapshot(rsnapshot_args)
+    except (ChildProcessError, FileNotFoundError, ValueError) as err:
+        print('Error:', err, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
