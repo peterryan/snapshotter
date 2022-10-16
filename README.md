@@ -1,4 +1,7 @@
 # snapshotter
+[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.7-yellow.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 Python script to execute rsnapshot using the required retain-level as needed
 making it possible to create a new snapshot at will, without any concern to
 which retain-level must be used.
